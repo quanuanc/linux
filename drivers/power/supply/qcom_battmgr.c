@@ -1299,7 +1299,16 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 		val->intval = battmgr->usb.current_limit;
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
-		val->intval = battmgr->usb.usb_type;
+		/*
+		 * The Oplus firmware reports PD through a data-capable USB port as
+		 * the vendor-specific PD_SDP type. Keep the raw value for internal
+		 * charging policy, but expose it as standard PD through the power
+		 * supply ABI.
+		 */
+		if (battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_PD_SDP)
+			val->intval = POWER_SUPPLY_USB_TYPE_PD;
+		else
+			val->intval = battmgr->usb.usb_type;
 		break;
 	default:
 		return -EINVAL;
