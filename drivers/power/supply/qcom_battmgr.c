@@ -27,6 +27,7 @@
 enum qcom_battmgr_variant {
 	QCOM_BATTMGR_SC8280XP,
 	QCOM_BATTMGR_SM8350,
+	QCOM_BATTMGR_SM8450_OPLUS,
 	QCOM_BATTMGR_SM8550,
 	QCOM_BATTMGR_X1E80100,
 };
@@ -189,6 +190,9 @@ enum oplus_power_supply_usb_type {
 #define CHARGE_CTRL_END_THR_MIN		55
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
+#define OPLUS_CHARGE_CTRL_DEFAULT_START	75
+#define OPLUS_CHARGE_CTRL_DEFAULT_END	80
+#define OPLUS_CHARGE_CTRL_POLL_MS	5000
 
 /* Oplus OEM read buffer opcode and layout */
 #define OEM_OPCODE_READ_BUFFER         0x10000
@@ -518,6 +522,11 @@ struct qcom_battmgr {
         /* ADSP told AP to suspend charging (notification 0x61) */
         bool adsp_suspended_chg;
 
+	/* Oplus charge-limit policy, implemented by toggling BATT_CHG_EN. */
+	bool charge_ctrl_inhibit;
+	bool charge_ctrl_state_valid;
+	struct delayed_work charge_ctrl_work;
+
 	bool otg_enabled;
 
 	struct gpio_desc *otg_boost_en_gpio;
@@ -748,7 +757,11 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	if (!battmgr->service_up)
 		return -EAGAIN;
 
-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+	if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS &&
+	    (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	     psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD))
+		ret = 0;
+	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
 	else
@@ -769,6 +782,9 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
                 mutex_unlock(&battmgr->lock);
 
 		val->intval = battmgr->status.status;
+		if (battmgr->charge_ctrl_inhibit &&
+		    (battmgr->usb.online || battmgr->wireless.online))
+			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
                 /*
                  * The Oplus ADSP doesn't reliably update BATT_STATUS on
                  * charger removal — it can stay stuck at "Charging".
@@ -782,7 +798,8 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
                  * when a charger is connected and current is flowing in.
                  * Override based on actual charger presence.
                  */
-                if ((battmgr->usb.online || battmgr->wireless.online) &&
+		if (!battmgr->charge_ctrl_inhibit &&
+		    (battmgr->usb.online || battmgr->wireless.online) &&
                     val->intval == POWER_SUPPLY_STATUS_DISCHARGING)
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		break;
@@ -925,7 +942,112 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
 		.delta_soc = cpu_to_le32(delta_soc),
 	};
 
+	if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS)
+		return 0;
+
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+}
+
+static int qcom_battmgr_oplus_set_charging(struct qcom_battmgr *battmgr,
+					    bool enable)
+{
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	if (!enable)
+		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					     USB_OPLUS_VOOCPHY_ENABLE, 0);
+
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					    BATT_OPLUS_CHG_EN, enable);
+	if (enable)
+		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					     USB_OPLUS_VOOCPHY_ENABLE, 1);
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+static void qcom_battmgr_oplus_charge_control_work(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						    struct qcom_battmgr,
+						    charge_ctrl_work);
+	bool inhibit;
+	bool was_inhibit;
+	bool update_state;
+	u32 start_soc, end_soc;
+	unsigned int soc;
+	int ret;
+
+	if (!battmgr->service_up)
+		return;
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					    BATT_CAPACITY, 0);
+	mutex_unlock(&battmgr->lock);
+	if (ret)
+		goto reschedule;
+
+	if (!qcom_battmgr_oem_read_buffer(battmgr))
+		qcom_battmgr_apply_oem_data(battmgr);
+
+	soc = battmgr->status.percent;
+	if (soc > 100)
+		goto reschedule;
+
+	mutex_lock(&battmgr->lock);
+	start_soc = battmgr->info.charge_ctrl_start;
+	end_soc = battmgr->info.charge_ctrl_end;
+
+	/* An end threshold of 100 means normal, unrestricted charging. */
+	if (end_soc >= 100)
+		inhibit = false;
+	else if (battmgr->charge_ctrl_inhibit)
+		inhibit = soc > start_soc;
+	else
+		inhibit = soc >= end_soc;
+
+	update_state = !battmgr->charge_ctrl_state_valid ||
+		       inhibit != battmgr->charge_ctrl_inhibit;
+	if (update_state) {
+		was_inhibit = battmgr->charge_ctrl_inhibit;
+		battmgr->charge_ctrl_inhibit = inhibit;
+	}
+	mutex_unlock(&battmgr->lock);
+
+	if (update_state) {
+		ret = qcom_battmgr_oplus_set_charging(battmgr, !inhibit);
+		if (ret) {
+			mutex_lock(&battmgr->lock);
+			battmgr->charge_ctrl_inhibit = was_inhibit;
+			mutex_unlock(&battmgr->lock);
+			dev_warn(battmgr->dev,
+				 "failed to %s charging for charge limit: %d\n",
+				 inhibit ? "disable" : "enable", ret);
+			goto reschedule;
+		}
+
+		mutex_lock(&battmgr->lock);
+		battmgr->charge_ctrl_state_valid = true;
+		mutex_unlock(&battmgr->lock);
+		dev_info(battmgr->dev,
+			 "charge limit: charging %s at %u%% (start %u%%, end %u%%)\n",
+			 inhibit ? "disabled" : "enabled", soc, start_soc, end_soc);
+		power_supply_changed(battmgr->bat_psy);
+
+		if (!inhibit) {
+			battmgr->vooc_limits_set = false;
+			battmgr->last_configured_adap_type = -1;
+			mod_delayed_work(system_wq, &battmgr->voocphy_recheck_work,
+					 msecs_to_jiffies(100));
+		}
+	}
+
+reschedule:
+	schedule_delayed_work(&battmgr->charge_ctrl_work,
+			      msecs_to_jiffies(OPLUS_CHARGE_CTRL_POLL_MS));
 }
 
 static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
@@ -952,13 +1074,15 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
-	mutex_unlock(&battmgr->lock);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = start_soc;
 		battmgr->info.charge_ctrl_end = target_soc;
 	}
+	mutex_unlock(&battmgr->lock);
+	if (!ret && battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS)
+		mod_delayed_work(system_wq, &battmgr->charge_ctrl_work, 0);
 
-	return 0;
+	return ret;
 }
 
 static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
@@ -973,13 +1097,15 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
 
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
-	mutex_unlock(&battmgr->lock);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
 		battmgr->info.charge_ctrl_end = end_soc;
 	}
+	mutex_unlock(&battmgr->lock);
+	if (!ret && battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS)
+		mod_delayed_work(system_wq, &battmgr->charge_ctrl_work, 0);
 
-	return 0;
+	return ret;
 }
 
 static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
@@ -1006,6 +1132,9 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
 
 		battmgr->info.charge_ctrl_start = start_soc;
 		battmgr->info.charge_ctrl_end = end_soc;
+	} else if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS) {
+		battmgr->info.charge_ctrl_start = OPLUS_CHARGE_CTRL_DEFAULT_START;
+		battmgr->info.charge_ctrl_end = OPLUS_CHARGE_CTRL_DEFAULT_END;
 	}
 
 	return 0;
@@ -1147,6 +1276,42 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 	.properties = sm8350_bat_props,
 	.num_properties = ARRAY_SIZE(sm8350_bat_props),
 	.get_property = qcom_battmgr_bat_get_property,
+};
+
+static const enum power_supply_property sm8450_oplus_bat_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
+	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
+	POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
+	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
+	POWER_SUPPLY_PROP_POWER_NOW,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static const struct power_supply_desc sm8450_oplus_bat_psy_desc = {
+	.name = "qcom-battmgr-bat",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = sm8450_oplus_bat_props,
+	.num_properties = ARRAY_SIZE(sm8450_oplus_bat_props),
+	.get_property = qcom_battmgr_bat_get_property,
+	.set_property = qcom_battmgr_bat_set_property,
+	.property_is_writeable = qcom_battmgr_bat_is_writeable,
 };
 
 static const enum power_supply_property sm8550_bat_props[] = {
@@ -2444,7 +2609,8 @@ static void qcom_battmgr_chg_status_reply_work(struct work_struct *work)
 {
         struct qcom_battmgr *battmgr = container_of(work,
                         struct qcom_battmgr, chg_status_reply_work);
-        int status = !battmgr->adsp_suspended_chg;
+	int status = !battmgr->adsp_suspended_chg &&
+		     !battmgr->charge_ctrl_inhibit;
         int ret;
 
         if (!battmgr->service_up)
@@ -2605,11 +2771,13 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
                 /* Enable charging */
                 qcom_battmgr_request_property(battmgr,
                                 BATTMGR_BAT_PROPERTY_SET,
-                                BATT_OPLUS_CHG_EN, 1);
-                /* Enable VoocPHY (needed for DCP/VOOC) */
-                qcom_battmgr_request_property(battmgr,
-                                BATTMGR_USB_PROPERTY_SET,
-                                USB_OPLUS_VOOCPHY_ENABLE, 1);
+				BATT_OPLUS_CHG_EN,
+				!battmgr->charge_ctrl_inhibit);
+		/* Enable VoocPHY only while charging is allowed. */
+		if (!battmgr->charge_ctrl_inhibit)
+			qcom_battmgr_request_property(battmgr,
+						BATTMGR_USB_PROPERTY_SET,
+						USB_OPLUS_VOOCPHY_ENABLE, 1);
                 mutex_unlock(&battmgr->lock);
 
                 /* Set FCC (skip for DCP — VoocPHY controls current) */
@@ -2631,7 +2799,8 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
         }
 
         /* Subsequent cycles for DCP: re-enable VoocPHY (stock behavior) */
-        if (adap_type == POWER_SUPPLY_USB_TYPE_DCP) {
+	if (adap_type == POWER_SUPPLY_USB_TYPE_DCP &&
+	    !battmgr->charge_ctrl_inhibit) {
                 mutex_lock(&battmgr->lock);
                 ret = qcom_battmgr_request_property(battmgr,
                                 BATTMGR_USB_PROPERTY_SET,
@@ -2671,6 +2840,8 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
          * pmic_glink_register_client().
          */
         qcom_battmgr_oplus_gauge_init(battmgr);
+	if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS)
+		mod_delayed_work(system_wq, &battmgr->charge_ctrl_work, 0);
 	schedule_delayed_work(&battmgr->otg_init_work, round_jiffies_relative(msecs_to_jiffies(3500)));
 }
 
@@ -2683,6 +2854,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		battmgr->service_up = false;
+		battmgr->charge_ctrl_state_valid = false;
 	}
 }
 
@@ -2691,6 +2863,7 @@ static const struct of_device_id qcom_battmgr_of_variants[] = {
 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
 	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
+	{ .compatible = "qcom,sm8450-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8450_OPLUS },
 	{ .compatible = "qcom,sm8550-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
 	{ .compatible = "qcom,x1e80100-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
 	/* Unmatched devices falls back to QCOM_BATTMGR_SM8350 */
@@ -2745,6 +2918,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
         INIT_DELAYED_WORK(&battmgr->voocphy_recheck_work,
                           qcom_battmgr_voocphy_recheck);
+	INIT_DELAYED_WORK(&battmgr->charge_ctrl_work,
+			  qcom_battmgr_oplus_charge_control_work);
         INIT_WORK(&battmgr->voocphy_status_work,
                   qcom_battmgr_voocphy_status_worker);
         INIT_WORK(&battmgr->chg_status_reply_work,
@@ -2799,6 +2974,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	} else {
 		if (battmgr->variant == QCOM_BATTMGR_SM8550)
 			psy_desc = &sm8550_bat_psy_desc;
+		else if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS)
+			psy_desc = &sm8450_oplus_bat_psy_desc;
 		else
 			psy_desc = &sm8350_bat_psy_desc;
 
