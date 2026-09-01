@@ -265,6 +265,7 @@ struct adreno_platform_config {
 };
 
 #define ADRENO_IDLE_TIMEOUT msecs_to_jiffies(1000)
+#define ADRENO_FAULT_COREDUMP_TIMEOUT msecs_to_jiffies(5000)
 
 #define spin_until(X) ({                                   \
 	int __ret = -ETIMEDOUT;                            \
