@@ -125,11 +125,15 @@ static int a6xx_hfi_wait_for_msg_interrupt(struct a6xx_gmu *gmu, u32 id, u32 seq
 		if (completion_done(&a6xx_gpu->base.fault_coredump_done))
 			break;
 
-		/* We may timeout because the GMU is temporarily wedged from
+		/*
+		 * We may timeout because the GMU is temporarily wedged from
 		 * pending faults from the GPU and we are taking a devcoredump.
-		 * Wait until the MMU is resumed and try again.
+		 * Wait until the MMU is resumed and try again, but do not let a
+		 * stuck crashstate capture wedge HFI transactions indefinitely.
 		 */
-		wait_for_completion(&a6xx_gpu->base.fault_coredump_done);
+		if (!wait_for_completion_timeout(&a6xx_gpu->base.fault_coredump_done,
+						 ADRENO_FAULT_COREDUMP_TIMEOUT))
+			break;
 	} while (true);
 
 	if (ret) {

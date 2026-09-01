@@ -597,7 +597,17 @@ void msm_gpu_fault_crashstate_capture(struct msm_gpu *gpu, struct msm_gpu_fault_
 	char *comm = NULL, *cmd = NULL;
 	unsigned int noreclaim_flag;
 
-	mutex_lock(&gpu->lock);
+	/*
+	 * Fault handling can race with recover_worker(), which holds gpu->lock
+	 * while GMU transactions wait for fault_coredump_done. Waiting for the
+	 * lock here would deadlock both paths. Crashstate capture is diagnostic,
+	 * so let recovery make progress when the GPU is already locked.
+	 */
+	if (!mutex_trylock(&gpu->lock)) {
+		DRM_DEV_DEBUG_DRIVER(gpu->dev->dev,
+				     "Skipping GPU fault crashstate capture while GPU is locked\n");
+		return;
+	}
 
 	submit = find_submit(cur_ring, cur_ring->memptrs->fence + 1);
 	if (submit && submit->fault_dumped)
