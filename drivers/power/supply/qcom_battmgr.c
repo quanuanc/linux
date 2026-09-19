@@ -1769,7 +1769,7 @@ static int oplus_otg_ovp_en_gpio_init(struct qcom_battmgr *battmgr)
 static void oplus_set_otg_boost_en_val(struct qcom_battmgr *battmgr, int value)
 {
 
-	if (battmgr->otg_boost_en_gpio <= 0)
+	if (IS_ERR_OR_NULL(battmgr->otg_boost_en_gpio))
 		return;
 
 	if (IS_ERR_OR_NULL(battmgr->otg_boost_en_pinctrl)
@@ -1791,7 +1791,7 @@ static void oplus_set_otg_boost_en_val(struct qcom_battmgr *battmgr, int value)
 static void oplus_set_otg_ovp_en_val(struct qcom_battmgr *battmgr, int value)
 {
 
-	if (battmgr->otg_ovp_en_gpio <= 0)
+	if (IS_ERR_OR_NULL(battmgr->otg_ovp_en_gpio))
 		return;
 
 	if (IS_ERR_OR_NULL(battmgr->otg_ovp_en_pinctrl)
