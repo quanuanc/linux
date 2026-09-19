@@ -781,7 +781,8 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
                 mutex_unlock(&battmgr->lock);
 
 		val->intval = battmgr->status.status;
-		if (battmgr->charge_ctrl_inhibit &&
+		if (battmgr->charge_ctrl_state_valid &&
+		    battmgr->charge_ctrl_inhibit &&
 		    (battmgr->usb.online || battmgr->wireless.online))
 			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
                 /*
@@ -950,21 +951,23 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
 static int qcom_battmgr_oplus_set_charging(struct qcom_battmgr *battmgr,
 					    bool enable)
 {
-	int ret;
+	int ret, vooc_ret = 0;
 
-	mutex_lock(&battmgr->lock);
+	lockdep_assert_held(&battmgr->lock);
 	if (!enable)
-		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					     USB_OPLUS_VOOCPHY_ENABLE, 0);
+		vooc_ret = qcom_battmgr_request_property(battmgr,
+					BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_VOOCPHY_ENABLE, 0);
 
+	/* Still try to stop charging if disabling VoocPHY failed. */
 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
 					    BATT_OPLUS_CHG_EN, enable);
-	if (enable)
-		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					     USB_OPLUS_VOOCPHY_ENABLE, 1);
-	mutex_unlock(&battmgr->lock);
+	if (enable && !ret)
+		vooc_ret = qcom_battmgr_request_property(battmgr,
+					BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_VOOCPHY_ENABLE, 1);
 
-	return ret;
+	return ret ?: vooc_ret;
 }
 
 static void qcom_battmgr_oplus_charge_control_work(struct work_struct *work)
@@ -973,7 +976,6 @@ static void qcom_battmgr_oplus_charge_control_work(struct work_struct *work)
 						    struct qcom_battmgr,
 						    charge_ctrl_work);
 	bool inhibit;
-	bool was_inhibit;
 	bool update_state;
 	u32 start_soc, end_soc;
 	unsigned int soc;
@@ -1011,26 +1013,21 @@ static void qcom_battmgr_oplus_charge_control_work(struct work_struct *work)
 	update_state = !battmgr->charge_ctrl_state_valid ||
 		       inhibit != battmgr->charge_ctrl_inhibit;
 	if (update_state) {
-		was_inhibit = battmgr->charge_ctrl_inhibit;
+		/* Keep the requested policy even if a command only partly succeeds. */
 		battmgr->charge_ctrl_inhibit = inhibit;
+		ret = qcom_battmgr_oplus_set_charging(battmgr, !inhibit);
+		battmgr->charge_ctrl_state_valid = !ret;
 	}
 	mutex_unlock(&battmgr->lock);
 
 	if (update_state) {
-		ret = qcom_battmgr_oplus_set_charging(battmgr, !inhibit);
 		if (ret) {
-			mutex_lock(&battmgr->lock);
-			battmgr->charge_ctrl_inhibit = was_inhibit;
-			mutex_unlock(&battmgr->lock);
 			dev_warn(battmgr->dev,
 				 "failed to %s charging for charge limit: %d\n",
 				 inhibit ? "disable" : "enable", ret);
 			goto reschedule;
 		}
 
-		mutex_lock(&battmgr->lock);
-		battmgr->charge_ctrl_state_valid = true;
-		mutex_unlock(&battmgr->lock);
 		dev_info(battmgr->dev,
 			 "charge limit: charging %s at %u%% (start %u%%, end %u%%)\n",
 			 inhibit ? "disabled" : "enabled", soc, start_soc, end_soc);
@@ -1056,6 +1053,13 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 
 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
 
+	mutex_lock(&battmgr->lock);
+	if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS &&
+	    start_soc == battmgr->info.charge_ctrl_end) {
+		mutex_unlock(&battmgr->lock);
+		return -EINVAL;
+	}
+
 	/*
 	 * If the new start threshold is larger than the old end threshold,
 	 * move the end threshold one step (DELTA_SOC) after the new start
@@ -1071,7 +1075,6 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 		delta_soc = battmgr->info.charge_ctrl_end - start_soc;
 	}
 
-	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = start_soc;
@@ -1091,10 +1094,10 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
 
 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
 
+	mutex_lock(&battmgr->lock);
 	if (battmgr->info.charge_ctrl_start && end_soc > battmgr->info.charge_ctrl_start)
 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
 
-	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
@@ -1128,6 +1131,10 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
 		start_soc = end_soc - delta_soc;
 		end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
 		start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
+
+		if (battmgr->variant == QCOM_BATTMGR_SM8450_OPLUS &&
+		    start_soc >= end_soc)
+			return -EINVAL;
 
 		battmgr->info.charge_ctrl_start = start_soc;
 		battmgr->info.charge_ctrl_end = end_soc;
@@ -2608,14 +2615,15 @@ static void qcom_battmgr_chg_status_reply_work(struct work_struct *work)
 {
         struct qcom_battmgr *battmgr = container_of(work,
                         struct qcom_battmgr, chg_status_reply_work);
-	int status = !battmgr->adsp_suspended_chg &&
-		     !battmgr->charge_ctrl_inhibit;
+	int status;
         int ret;
 
         if (!battmgr->service_up)
                 return;
 
         mutex_lock(&battmgr->lock);
+	status = !battmgr->adsp_suspended_chg &&
+		 !battmgr->charge_ctrl_inhibit;
         ret = qcom_battmgr_request_property(battmgr,
                         BATTMGR_BAT_PROPERTY_SET,
                         BATT_OPLUS_SEND_CHG_STATUS, status);
@@ -2800,17 +2808,17 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
         }
 
         /* Subsequent cycles for DCP: re-enable VoocPHY (stock behavior) */
+	mutex_lock(&battmgr->lock);
 	if (adap_type == POWER_SUPPLY_USB_TYPE_DCP &&
 	    !battmgr->charge_ctrl_inhibit) {
-                mutex_lock(&battmgr->lock);
                 ret = qcom_battmgr_request_property(battmgr,
                                 BATTMGR_USB_PROPERTY_SET,
                                 USB_OPLUS_VOOCPHY_ENABLE, 1);
-                mutex_unlock(&battmgr->lock);
                 if (ret)
                         dev_dbg(battmgr->dev,
                                 "voocphy re-enable failed: %d\n", ret);
         }
+	mutex_unlock(&battmgr->lock);
 
 reschedule:
         schedule_delayed_work(&battmgr->voocphy_recheck_work,
@@ -2889,6 +2897,23 @@ static void oplus_otg_init_status_func(struct work_struct *work)
 	// 	chg_err("Oplus_otg_ap_enable,flag bcdev->cid_status != 0\n");
 	// 	oplus_ccdetect_enable(battmgr);
 	// }
+}
+
+static void qcom_battmgr_disable_work(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	/*
+	 * Disable producers as well as periodic work: callbacks and sysfs
+	 * writers may still try to queue work until their resources are freed.
+	 * Keep the GLINK client and power supplies alive while draining work.
+	 */
+	disable_work_sync(&battmgr->enable_work);
+	disable_delayed_work_sync(&battmgr->charge_ctrl_work);
+	disable_delayed_work_sync(&battmgr->voocphy_recheck_work);
+	disable_work_sync(&battmgr->voocphy_status_work);
+	disable_work_sync(&battmgr->chg_status_reply_work);
+	disable_delayed_work_sync(&battmgr->otg_init_work);
 }
 
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
@@ -3002,6 +3027,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 						       battmgr);
 	if (IS_ERR(battmgr->client))
 		return PTR_ERR(battmgr->client);
+
+	/* Registered last so work is disabled before the client is released. */
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_disable_work, battmgr);
+	if (ret)
+		return ret;
 
 	pmic_glink_client_register(battmgr->client);
 
